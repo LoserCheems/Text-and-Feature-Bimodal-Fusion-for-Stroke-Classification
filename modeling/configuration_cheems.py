@@ -49,6 +49,8 @@ class CheemsConfig(PretrainedConfig):
         mamba_conv_bias=False,
         mamba_proj_bias=False,
         mamba_inner_layernorms=True,
+        mamba_in_mlp=False,
+        mamba_out_mlp=False,
         
         **kwargs
     ):
@@ -91,7 +93,9 @@ class CheemsConfig(PretrainedConfig):
         self.mamba_conv_bias = mamba_conv_bias
         self.mamba_proj_bias = mamba_proj_bias
         self.mamba_inner_layernorms = mamba_inner_layernorms
-
+        self.mamba_in_mlp = mamba_in_mlp
+        self.mamba_out_mlp = mamba_out_mlp
+        
         super().__init__(
             torch_dtype = torch_dtype,
             attn_implementation = attn_implementation,

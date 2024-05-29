@@ -809,6 +809,9 @@ class CheemsMambaMixer(nn.Module):
         self.time_step_rank = config.mamba_dt_rank
         self.use_conv_bias = config.mamba_conv_bias
         self.use_bias = config.mamba_proj_bias
+
+        self.mamba_in_mlp = config.mamba_in_mlp
+        self.mamba_out_mlp = config.mamba_out_mlp
         # self.conv1d = nn.Conv1d(
         #     in_channels=self.intermediate_size,
         #     out_channels=self.intermediate_size,
@@ -833,11 +836,40 @@ class CheemsMambaMixer(nn.Module):
         self.use_fast_kernels = config.use_mamba_kernels
 
         # 输入隐藏状态的投影
-        self.in_proj = nn.Linear(
-            self.hidden_size, 
-            self.intermediate_size * 2, 
-            bias=self.use_bias,
-        )
+        if self.mamba_in_mlp:
+            self.in_up_proj = nn.Linear(
+                self.hidden_size,
+                self.intermediate_size * config.mamba_expand,
+                bias=self.use_bias,
+            )
+            self.in_down_proj = nn.Linear(
+                self.intermediate_size * config.mamba_expand,
+                self.intermediate_size,
+                bias=self.use_bias,
+            )
+  
+            self.gate_up_proj = nn.Linear(
+                self.hidden_size,
+                self.intermediate_size * config.mamba_expand,
+                bias=self.use_bias,
+            )
+            self.gate_down_proj = nn.Linear(
+                self.intermediate_size * config.mamba_expand,
+                self.intermediate_size,
+                bias=self.use_bias,
+            )
+        else:
+            self.in_proj = nn.Linear(
+                self.hidden_size, 
+                self.intermediate_size, 
+                bias=self.use_bias,
+            )
+            self.gate_proj = nn.Linear(
+                self.hidden_size, 
+                self.intermediate_size, 
+                bias=self.use_bias,
+            )
+
  
         # 用于使dt, B和C依赖于输入的选择性投影
         self.x_proj = nn.Linear(
@@ -860,12 +892,28 @@ class CheemsMambaMixer(nn.Module):
 
         self.A_log = nn.Parameter(torch.log(A))
         self.D = nn.Parameter(torch.ones(self.intermediate_size))
-        self.out_proj = nn.Linear(
-            self.intermediate_size, 
-            self.hidden_size, 
-            bias=self.use_bias,
-            **_config_to_kwargs(config)
-        )
+
+        # 输出投影
+        if self.mamba_out_mlp:
+            self.out_up_proj = nn.Linear(
+                self.intermediate_size,
+                self.intermediate_size * config.mamba_expand,
+                bias=self.use_bias,
+                **_config_to_kwargs(config)
+            )
+            self.out_down_proj = nn.Linear(
+                self.intermediate_size * config.mamba_expand,
+                self.hidden_size,
+                bias=self.use_bias,
+                **_config_to_kwargs(config)
+            )
+        else:
+            self.out_proj = nn.Linear(
+                self.intermediate_size, 
+                self.hidden_size, 
+                bias=self.use_bias,
+                **_config_to_kwargs(config)
+            )
 
         if self.apply_inner_layernorms:
             self.dt_layernorm = RMSNorm(self.time_step_rank, eps=config.rms_norm_eps)
@@ -892,110 +940,96 @@ class CheemsMambaMixer(nn.Module):
 
     def cuda_kernels_forward(self, hidden_states: torch.Tensor, cache_params: MambaCacheParams = None):
         # 1. 门控MLP的线性投影
-        projected_states = self.in_proj(hidden_states.to(torch.float32)).transpose(1, 2)
-
-        if (
-            self.training and cache_params is None and not self.apply_inner_layernorms
-        ):  # 不支持输出状态 -> 用于训练
-            contextualized_states = mamba_inner_fn(
-                projected_states,
-                self.conv1d.weight,
-                self.conv1d.bias if self.use_conv_bias else None,
-                self.x_proj.weight,
-                self.dt_proj.weight,
-                self.out_proj.weight,
-                self.out_proj.bias.float() if self.use_bias else None,
-                -torch.exp(self.A_log.float()),
-                None,  # 输入相关的B
-                None,  # 输入相关的C
-                self.D.float(),
-                delta_bias=self.dt_proj.bias.float(),
-                delta_softplus=True,
-            )
-
+        if self.mamba_in_mlp:
+            gate = self.gate_down_proj(self.act(self.gate_up_proj(hidden_states.to(torch.float32)))).transpose(1, 2)
+            hidden_states = self.in_down_proj(self.act(self.in_up_proj(hidden_states.to(torch.float32)))).transpose(1, 2)
         else:
-            hidden_states, gate = projected_states.chunk(2, dim=1)
+            gate = self.gate_proj(hidden_states.to(torch.float32)).transpose(1, 2)
+            hidden_states = self.in_proj(hidden_states.to(torch.float32)).transpose(1, 2)
 
-            # 2. 卷积序列转换
-            conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
-            if cache_params is not None and cache_params.seqlen_offset > 0:
-                hidden_states = causal_conv1d_update(
-                    hidden_states.squeeze(-1),
-                    cache_params.conv_states[self.layer_idx].to(hidden_states.dtype),
-                    conv_weights,
-                    self.conv1d.bias,
-                    self.activation,
-                )
-                hidden_states = hidden_states.unsqueeze(-1)
-            else:
-                if cache_params is not None:
-                    conv_states = nn.functional.pad(
-                        hidden_states, (self.conv_kernel_size - hidden_states.shape[-1], 0)
-                    )
-                    cache_params.conv_states[self.layer_idx].copy_(conv_states)
-                hidden_states = causal_conv1d_fn(
-                    hidden_states, conv_weights, self.conv1d.bias, activation=self.activation
-                )
-
-            # 3. 状态空间模型序列转换
-            # 3.a. 时间步, B和C的输入变化初始化
-            ssm_parameters = self.x_proj(hidden_states.transpose(1, 2))
-            time_step, B, C = torch.split(
-                ssm_parameters, [self.time_step_rank, self.ssm_state_size, self.ssm_state_size], dim=-1
+        # 2. 卷积序列转换
+        conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
+        if cache_params is not None and cache_params.seqlen_offset > 0:
+            hidden_states = causal_conv1d_update(
+                hidden_states.squeeze(-1),
+                cache_params.conv_states[self.layer_idx].to(hidden_states.dtype),
+                conv_weights,
+                self.conv1d.bias,
+                self.activation,
             )
-            time_step, B, C = self._apply_layernorms(time_step, B, C)
-
-            # 这里我们需要应用没有偏差的dt_proj, 因为偏差是在选择性扫描内核中添加的.
-            # 这是一个应用dt_proj的hack, 同时仍然使用`torch.nn.Linear`的前向传递, 这是为了使量化工作.
-            # 量化代码将`torch.nn.Linear`层替换为量化的线性层, 并要求直接调用前向传递.
-            # 这里的原始代码是: ```discrete_time_step = self.dt_proj.weight @ time_step.transpose(1, 2)```
-            
-            if hasattr(self.dt_proj, "base_layer"):
-                # 如果是LoRA, 我们需要访问基础层以获取权重
-                time_proj_bias = self.dt_proj.base_layer.bias
-                self.dt_proj.base_layer.bias = None
-            else:
-                time_proj_bias = self.dt_proj.bias
-                self.dt_proj.bias = None
-            discrete_time_step = self.dt_proj(time_step).transpose(1, 2)
-            if hasattr(self.dt_proj, "base_layer"):
-                self.dt_proj.base_layer.bias = time_proj_bias
-            else:
-                self.dt_proj.bias = time_proj_bias
-
-            A = -torch.exp(self.A_log.float())
-            # 3.c 执行循环 y ← SSM(A, B, C)(x)
-            time_proj_bias = time_proj_bias.float() if time_proj_bias is not None else None
-            if cache_params is not None and cache_params.seqlen_offset > 0:
-                scan_outputs = selective_state_update(
-                    cache_params.ssm_states[self.layer_idx],
-                    hidden_states[..., 0],
-                    discrete_time_step[..., 0],
-                    A,
-                    B[:, 0],
-                    C[:, 0],
-                    self.D,
-                    gate[..., 0],
-                    time_proj_bias,
-                    dt_softplus=True,
-                ).unsqueeze(-1)
-            else:
-                scan_outputs, ssm_state = selective_scan_fn(
-                    hidden_states,
-                    discrete_time_step,
-                    A,
-                    B.transpose(1, 2).float(),
-                    C.transpose(1, 2),
-                    self.D.float(),
-                    gate,
-                    time_proj_bias,
-                    delta_softplus=True,
-                    return_last_state=True,
+            hidden_states = hidden_states.unsqueeze(-1)
+        else:
+            if cache_params is not None:
+                conv_states = nn.functional.pad(
+                    hidden_states, (self.conv_kernel_size - hidden_states.shape[-1], 0)
                 )
-                if ssm_state is not None and cache_params is not None:
-                    cache_params.ssm_states[self.layer_idx].copy_(ssm_state)
+                cache_params.conv_states[self.layer_idx].copy_(conv_states)
+            hidden_states = causal_conv1d_fn(
+                hidden_states, conv_weights, self.conv1d.bias, activation=self.activation
+            )
 
-            # 4. 最终线性投影
+        # 3. 状态空间模型序列转换
+        # 3.a. 时间步, B和C的输入变化初始化
+        ssm_parameters = self.x_proj(hidden_states.transpose(1, 2))
+        time_step, B, C = torch.split(
+            ssm_parameters, [self.time_step_rank, self.ssm_state_size, self.ssm_state_size], dim=-1
+        )
+        time_step, B, C = self._apply_layernorms(time_step, B, C)
+
+        # 这里我们需要应用没有偏差的dt_proj, 因为偏差是在选择性扫描内核中添加的.
+        # 这是一个应用dt_proj的hack, 同时仍然使用`torch.nn.Linear`的前向传递, 这是为了使量化工作.
+        # 量化代码将`torch.nn.Linear`层替换为量化的线性层, 并要求直接调用前向传递.
+        # 这里的原始代码是: ```discrete_time_step = self.dt_proj.weight @ time_step.transpose(1, 2)```
+        
+        if hasattr(self.dt_proj, "base_layer"):
+            # 如果是LoRA, 我们需要访问基础层以获取权重
+            time_proj_bias = self.dt_proj.base_layer.bias
+            self.dt_proj.base_layer.bias = None
+        else:
+            time_proj_bias = self.dt_proj.bias
+            self.dt_proj.bias = None
+        discrete_time_step = self.dt_proj(time_step).transpose(1, 2)
+        if hasattr(self.dt_proj, "base_layer"):
+            self.dt_proj.base_layer.bias = time_proj_bias
+        else:
+            self.dt_proj.bias = time_proj_bias
+
+        A = -torch.exp(self.A_log.float())
+        # 3.c 执行循环 y ← SSM(A, B, C)(x)
+        time_proj_bias = time_proj_bias.float() if time_proj_bias is not None else None
+        if cache_params is not None and cache_params.seqlen_offset > 0:
+            scan_outputs = selective_state_update(
+                cache_params.ssm_states[self.layer_idx],
+                hidden_states[..., 0],
+                discrete_time_step[..., 0],
+                A,
+                B[:, 0],
+                C[:, 0],
+                self.D,
+                gate[..., 0],
+                time_proj_bias,
+                dt_softplus=True,
+            ).unsqueeze(-1)
+        else:
+            scan_outputs, ssm_state = selective_scan_fn(
+                hidden_states,
+                discrete_time_step,
+                A,
+                B.transpose(1, 2).float(),
+                C.transpose(1, 2),
+                self.D.float(),
+                gate,
+                time_proj_bias,
+                delta_softplus=True,
+                return_last_state=True,
+            )
+            if ssm_state is not None and cache_params is not None:
+                cache_params.ssm_states[self.layer_idx].copy_(ssm_state)
+
+        # 4. 最终线性投影
+        if self.mamba_out_mlp:
+            contextualized_states = self.out_down_proj(self.act(self.out_up_proj(scan_outputs.to(self.dtype).transpose(1, 2))))
+        else:
             contextualized_states = self.out_proj(scan_outputs.to(self.dtype).transpose(1, 2))
         return contextualized_states
 
@@ -1004,8 +1038,12 @@ class CheemsMambaMixer(nn.Module):
         batch_size, seq_len, _ = input_states.shape
         dtype = input_states.dtype
         # 1. 门控MLP的线性投影
-        projected_states = self.in_proj(input_states.to(torch.float32)).transpose(1, 2) # [batch, 2 * intermediate_size, seq_len]
-        hidden_states, gate = projected_states.chunk(2, dim=1)
+        if self.mamba_in_mlp:
+            gate = self.gate_down_proj(self.act(self.gate_up_proj(input_states))).transpose(1, 2)
+            hidden_states = self.in_down_proj(self.act(self.in_up_proj(input_states))).transpose(1, 2)
+        else:
+            gate = self.gate_proj(input_states).transpose(1, 2)
+            hidden_states = self.in_proj(input_states).transpose(1, 2)
 
         # 2. 卷积序列转换
         if cache_params is not None:
@@ -1070,7 +1108,10 @@ class CheemsMambaMixer(nn.Module):
             cache_params.ssm_states[self.layer_idx].copy_(ssm_state)
 
         # 4. 最终线性投影
-        contextualized_states = self.out_proj(scan_output.transpose(1, 2)) # [batch, seq_len, hidden_size]
+        if self.mamba_out_mlp:
+            contextualized_states = self.out_down_proj(self.act(self.out_up_proj(scan_output.transpose(1, 2))))
+        else:
+            contextualized_states = self.out_proj(scan_output.transpose(1, 2)) # [batch, seq_len, hidden_size]
         return contextualized_states
     # fmt: on
 
@@ -1143,7 +1184,6 @@ class CheemsMLP(nn.Module):
             bias=config.hidden_bias,
             **_config_to_kwargs(config)
         )
-        # 改进点
         self.gate_act_fn = nn.Tanh()
 
         self.up_proj = nn.Linear(
