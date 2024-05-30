@@ -2,7 +2,7 @@
 
 ## 模型结构总图
 
-![modeling](./assets/modeling_cross.png)
+![modeling](./assets/Modeling_cross.png)
 
 我们提出了一种基于 Mamba 和 Attention 的双模态融合模型, 它包括三个阶段: 双模态有效信息提取, 双模态信息融合和融合信息感知.
 
@@ -13,7 +13,7 @@ Mamba 已被证明在需要长期依赖建模的任务中无法与 Transformer �
 
 ## 双模态信息融合
 
-![non wo attention](./assets/non_wo_attention.png)
+![non_wo_attention](./assets/Non_Wo_Attention.png)
 
 在 Attention 中, 如果说 `Q` 相当于是一本没有热力图的书的原始文件, `K` 就相当于是在本书上你要注意的部分的热力图, `V` 相当于是你要注意的部分在原始文件的具体的东西, `V` 是 `Q` 的子集. `Q` 是原始数据, `K` 是提取原始数据的窗口, `V` 是被窗口提取的具体的值, 那么 `O` 则是最具体的值进行了加权的最终结果.
 
@@ -31,7 +31,7 @@ $$
 
 ## 融合信息感知
 
-![tanh gated mlp](./assets/tanh_gated_mlp.png)
+![tanh_gated_mlp](./assets/Tanh_Gated_MLP.png)
 
 由于在通过 MLP 之前我们进行了归一化操作确保数据在后续的神经网络层中能够得到更好的处理, 避免极端值对模型性能造成过大影响, 在进行归一化操作后, 数据的分布范围已经缩小到了一个更小的区间内.
 
