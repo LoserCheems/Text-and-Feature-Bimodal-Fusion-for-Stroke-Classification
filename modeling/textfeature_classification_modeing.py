@@ -1248,7 +1248,7 @@ class CheemsCrossAttention(nn.Module):
         self.non_wo_attention = NON_WO_ATTENTION_CLASSES[config._attn_implementation](config, self.intermediate_size)
 
         # 可以学习的缩放因子 (2个)
-        self.log = nn.Parameter(torch.log(torch.ones(self.intermediate_size)))
+        self.log = nn.Parameter(torch.ones(self.intermediate_size))
         self.scale = nn.Parameter(torch.ones(self.intermediate_size))
 
         # W_o

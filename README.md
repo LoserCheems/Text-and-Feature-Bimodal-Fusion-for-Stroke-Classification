@@ -24,10 +24,7 @@ Mamba 已被证明在需要长期依赖建模的任务中无法与 Transformer �
 然后我们将双模态的信息进行缩放, 这里的缩放因子也是可以学习的参数, 让模型通过训练自主决定各个模态信息的重要性.
 
 $$
-% self.log = nn.Parameter(torch.log(torch.ones(self.intermediate_size)))
-% self.scale = nn.Parameter(torch.ones(self.intermediate_size))
-% hidden_states * torch.exp(self.log.float()) / torch.sqrt(self.scale)
-Scale(x, W, W_2) = \frac{x \times e^{log(W)}}{\sqrt{W_2}}
+Scale(x, W, W_2) = \frac{x \times e^{W}}{\sqrt{W_2}}
 $$
 
 最后我们将双模态信息在隐藏维度上进行拼接, 使其通过 `WO` 得到最终的融合信息.
