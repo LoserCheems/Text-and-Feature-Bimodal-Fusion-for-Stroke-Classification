@@ -27,11 +27,18 @@ from transformers.models.llama.modeling_llama import LlamaForSequenceClassificat
 from transformers.models.phi.modeling_phi import PhiConfig
 from transformers.models.phi.modeling_phi import PhiForSequenceClassification
 
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
 
-def evaluate_acc(logits, labels):
+
+def evaluate_acc_precision_recall_f1(logits, labels):  
     preds = torch.argmax(logits, dim=1)
-    acc = torch.sum(preds == labels).item() / len(labels)
-    return acc
+    labels = labels.cpu().numpy()
+    preds = preds.cpu().numpy()
+    acc = accuracy_score(labels, preds)
+    precision = precision_score(labels, preds, zero_division=0)
+    recall = recall_score(labels, preds, zero_division=0)
+    f1 = f1_score(labels, preds, zero_division=0)
+    return acc, precision, recall, f1
 
 
 # 训练函数
@@ -109,6 +116,9 @@ def trainer(
         if (epoch+1) % 4 == 0:
             model.eval()
             accs = []
+            precisions = []
+            recalls = []
+            f1s = []
             for step, batch in enumerate(eval_loader):
                 if model.__class__.__name__ == "CheemsForSequenceClassification":
                     inputs = {
@@ -128,9 +138,16 @@ def trainer(
                 outputs = model(**inputs)
                 logits = outputs.logits
                 labels = inputs["labels"]
-                accs.append(evaluate_acc(logits, labels))
+                acc, precision, recall, f1 = evaluate_acc_precision_recall_f1(logits, labels)
+                accs.append(acc)
+                precisions.append(precision)
+                recalls.append(recall)
+                f1s.append(f1)
             acc = sum(accs) / len(accs)
-            logger.info(f"\nEpoch [{epoch+1}/{epochs}], Eval ACC: {acc:.4f}\n")
+            precision = sum(precisions) / len(precisions)
+            recall = sum(recalls) / len(recalls)
+            f1 = sum(f1s) / len(f1s)
+            logger.info(f"\nEpoch [{epoch+1}/{epochs}], Eval ACC: {acc:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}\n")
             
             # 保存模型
             model.save_pretrained(f"./models/{model.__class__.__name__}_epoch_{epoch+1}")
@@ -174,7 +191,7 @@ if __name__ == "__main__":
     # lr
     parser.add_argument("--lr", type=float, default=2e-5)
     # epochs
-    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--epochs", type=int, default=64)
     args = parser.parse_args()
     
     # 加载数据集
@@ -183,9 +200,9 @@ if __name__ == "__main__":
     eval_dataset = HealthCare_Dataset('./data/healthcare_stroke', 'eval', tokenizer, max_length=128)
 
     train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
-    eval_loader = DataLoader(eval_dataset, batch_size=16, shuffle=False)
+    eval_loader = DataLoader(eval_dataset, batch_size=1, shuffle=False)
 
-    device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
     # 学习率
     def lrate(
@@ -284,6 +301,7 @@ if __name__ == "__main__":
     # Phi模型
     config = PhiConfig()
     config.vocab_size = tokenizer.vocab_size
+    config.pad_token_id = tokenizer.pad_token_id
     config.num_hidden_layers = 12
     config.hidden_size = 1024
     config.intermediate_size = 1024*4
